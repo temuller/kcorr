@@ -93,6 +93,6 @@ def gp_predict(times_pred, wavelengths_pred, ratio_pred, error_pred, gp_model, r
     mu, cov = gp_model.predict(y, X_test=X_test, return_var=return_var, return_cov=True)
     # renormalise outputs and convert jax-Array to numpy-array
     mu = np.array(mu) * y_norm
-    cov = np.array(cov) * y_norm ** 2
+    cov = np.array(cov) * (y_norm ** 2)
 
     return mu, cov
