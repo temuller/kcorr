@@ -10,7 +10,7 @@ from photometry import Photometry
 from sed import SED
 from gp_fit import fit_gp_model, gp_predict
 
-class Refiner(object):
+class SEDMangler(object):
     """Object for building a colour-matched SED model.
     """
     def __init__(self, 
@@ -36,28 +36,53 @@ class Refiner(object):
         self.phot = Photometry(data)
         self.bands = np.unique(self.phot.band)
         self.sed = SED(source, z, mwebv, phase_range, np.unique(self.bands))
+        # get the inital colour-stretch of the SED model
+        self._st = np.copy(self.sed._st)
+        self._init_st = np.copy(self.sed._init_st)
+        self._iter = 0  # iterations for the mangling
         
     def _setup_phase(self, t0: float):
-        """Loads the photometry of a supernova.
+        """Sets up the phase of the supernova photometry and range to use.
         """
         self.phot.phase = (self.phot.time - t0) / (1 + self.sed.z)
+        # consider limits of the SED model
+        min_phase = np.floor(np.max([self.phase_range[0],
+                                     self.sed.model.mintime() * (self._st / self._init_st)]
+                                    )
+                             )
+        max_phase = np.ceil(np.min([self.phase_range[1], 
+                                    self.sed.model.maxtime() * (self._st / self._init_st)]
+                                   )
+                            )
+        self.pred_phase = np.arange(min_phase, max_phase + 0.1, 0.1)
 
-    def match_sed(self, t0: float, k1: str = 'ExpSquared', fit_mean: bool = True):
-        """Modifies the SED model to match the observations using Gaussian Process (GP) regression.
+    def mangle_sed(self, t0: float = None, k1: str = 'ExpSquared', 
+        fit_mean: bool = True, time_scale: float = None, wave_scale: float = None):
+        """Modifies the SED model to match the observations using Gaussian Process (GP) 
+        regression.
 
         Parameters
         ----------
-        t0: time of reference (e.g. optical peak).
+        t0: time of reference (e.g. optical peak). If not given, the SED model is fit 
+            to estimate it.
         k1: GP kernel for the time axis.
         fit_mean: whether to fit a mean function (constant).
         """
+        if self._iter >= 3:
+            return None
+        if t0 is None:
+            self.fit_model()  # this sets self.t0
+        else:
+            self.t0 = t0
         # select phase range
-        self._setup_phase(t0)
-        minphase, maxphase = self.phase_range
-        self.phase_mask = (minphase <= self.phot.phase) & (self.phot.phase <= maxphase)
+        self._setup_phase(self.t0)
+        self.phase_mask = ((self.pred_phase.min() <= self.phot.phase) & 
+                           (self.phot.phase <=  self.pred_phase.max()
+                            )
+                           )
         # flux ratios
         model_flux = self.sed.model.bandflux(self.phot.band, 
-                                             self.phot.phase,
+                                             self.phot.phase / (self._st / self._init_st),
                                              zp=self.phot.zp, 
                                              zpsys=self.phot.zpsys)
         self.ratio_flux = self.phot.flux / model_flux
@@ -67,19 +92,32 @@ class Refiner(object):
                                      self.phot.eff_wave[self.phase_mask], 
                                      self.ratio_flux[self.phase_mask], 
                                      self.ratio_error[self.phase_mask], 
-                                     k1=k1, fit_mean=fit_mean)
+                                     k1=k1, fit_mean=fit_mean, 
+                                     time_scale=time_scale,wave_scale=wave_scale)
         self.gp_predict = partial(gp_predict, 
                                   ratio_pred=self.ratio_flux[self.phase_mask],
                                   error_pred=self.ratio_error[self.phase_mask],
                                   gp_model=self.gp_model,
                                  )
+        # get colour curve and colour-stretch
+        self.calculate_colour("cspb", "cspv", set_st=True, plot=False)
+        if ((np.abs(self.st - self._st) > 0.05) or 
+            (np.abs(self.st - self._st) > 3 * self.st_err)):
+            self._st = np.copy(self.st)
+            self.sed._st = np.copy(self.st)
+            self._iter += 1
+            self.mangle_sed(self.t0, k1, fit_mean)
+        else:
+            # updates values
+            self._st = np.copy(self.st)
+            self.sed._st = np.copy(self.st)
+            self._setup_phase(self.t0)
 
     def plot_fit(self):
         """Plots the light-curve fit and ratio between the observations and SED.
         """
         # phase range to use
-        minphase, maxphase = self.phase_range
-        pred_phase = np.arange(minphase, maxphase + 0.1, 0.1)
+        pred_phase = self.pred_phase.copy()
         
         fig, ax = plt.subplots(2, 1, height_ratios=(3, 1), gridspec_kw={"hspace":0})
         for band in self.bands:
@@ -101,7 +139,10 @@ class Refiner(object):
             obs_ratio_fit, obs_var_fit = self.gp_predict(pred_phase, pred_obs_wave)
             obs_std_fit = np.sqrt(obs_var_fit)
             # apply K-correction
-            obs_model_flux = self.sed.model.bandflux(band, pred_phase, zp=zp[0], zpsys=zpsys[0])
+            obs_model_flux = self.sed.model.bandflux(band, 
+                                                     pred_phase / (self._st / self._init_st), 
+                                                     zp=zp[0], 
+                                                     zpsys=zpsys[0])
             obs_kcorr_flux = obs_model_flux * obs_ratio_fit
             obs_kcorr_error = obs_model_flux * obs_std_fit
             
@@ -112,7 +153,10 @@ class Refiner(object):
             rest_ratio_fit, rest_var_fit = self.gp_predict(pred_phase, pred_rest_wave)
             rest_std_fit = np.sqrt(rest_var_fit)
             # apply K-correction
-            rest_model_flux = self.sed.rest_model.bandflux(band, pred_phase, zp=zp[0], zpsys=zpsys[0])
+            rest_model_flux = self.sed.rest_model.bandflux(band, 
+                                                           pred_phase, 
+                                                           zp=zp[0], 
+                                                           zpsys=zpsys[0])
             rest_kcorr_flux = rest_model_flux * rest_ratio_fit
             rest_kcorr_error = rest_model_flux * rest_std_fit
 
@@ -121,13 +165,14 @@ class Refiner(object):
             ########
             colour = self.sed.colours[band]
             # data
-            ax[0].errorbar(phase, flux, flux_err, ls="", marker="o", color=colour, label=band)
+            ax[0].errorbar(phase, flux, flux_err, 
+                           ls="", marker="o", color=colour, label=band)
             # model
             #ax[0].plot(pred_phase, rest_kcorr_flux, color=colour, ls='dotted')
             ax[0].plot(pred_phase, obs_kcorr_flux, color=colour)
             ax[0].fill_between(pred_phase, 
-                               obs_kcorr_flux - rest_kcorr_error, 
-                               obs_kcorr_flux + rest_kcorr_error, 
+                               obs_kcorr_flux - obs_kcorr_error, 
+                               obs_kcorr_flux + obs_kcorr_error, 
                                alpha=0.2,
                                color=colour)
         
@@ -145,8 +190,9 @@ class Refiner(object):
             
             # config
             ax[0].set_ylabel(r'$F_{\lambda}$', fontsize=16)
-            ax[1].set_xlabel('Days since B-maximum', fontsize=16)
-            ax[1].set_ylabel(r'$F_{\lambda}^{\rm data} / F_{\lambda}^{\rm SED}$', fontsize=16)
+            ax[1].set_xlabel(r'Days since $t_0$', fontsize=16)
+            ax[1].set_ylabel(r'$F_{\lambda}^{\rm data} / F_{\lambda}^{\rm SED}$', 
+                             fontsize=16)
             ax[0].set_title(f'"{self.source}" SED source (z={self.z})', fontsize=16)
             for i in range(2):
                 ax[i].tick_params('both', labelsize=14)
@@ -154,7 +200,7 @@ class Refiner(object):
         plt.show()
 
     def calculate_colour(self, band1: str, band2: str, zp: float = 30, zpsys: str = 'ab', 
-                         plot: bool = True):
+                         set_st: bool = False, plot: bool = True):
         """Calculates rest-frame colour using the colour-matched SED.
 
         Note: Colour = band1 - band2
@@ -167,6 +213,7 @@ class Refiner(object):
             include any of the given bands.
         zpsys: Magnitude system for both bands. Only used if the photometry
             does not  include any of the given bands.
+        set_st: Whether to set the colour-stretch parameter in the object.
         plot: Whether to plot the colour curve.
 
         Results
@@ -175,9 +222,7 @@ class Refiner(object):
         colour_err: Uncertainty.
         """
         # phase range to use
-        minphase, maxphase = self.phase_range
-        pred_phase = np.arange(minphase, maxphase + 0.1, 0.1)
-        self.pred_phase = pred_phase
+        pred_phase = self.pred_phase.copy()
 
         if (band1 not in self.phot.band) | (band2 not in self.phot.band):
             eff_wave1 = sncosmo.get_bandpass(band1).wave_eff
@@ -203,8 +248,14 @@ class Refiner(object):
                              [eff_wave2 * (1 + self.z)] * len(pred_phase) 
                             )
         # flux array
-        rest_model_flux1 = self.sed.rest_model.bandflux(band1, pred_phase, zp=zp1, zpsys=zpsys1)
-        rest_model_flux2 = self.sed.rest_model.bandflux(band2, pred_phase, zp=zp2, zpsys=zpsys2)
+        rest_model_flux1 = self.sed.rest_model.bandflux(band1, 
+                                                        pred_phase / (self._st / self._init_st), 
+                                                        zp=zp1, 
+                                                        zpsys=zpsys1)
+        rest_model_flux2 = self.sed.rest_model.bandflux(band2, 
+                                                        pred_phase / (self._st / self._init_st), 
+                                                        zp=zp2, 
+                                                        zpsys=zpsys2)
         rest_model_flux = np.r_[rest_model_flux1, rest_model_flux2]
         # K-corr. predict
         pred_phase_ = np.r_[pred_phase, pred_phase]
@@ -214,18 +265,20 @@ class Refiner(object):
         self.colour_flux_ratio = rest_kcorr_flux
         self.colour_flux_cov = rest_kcorr_cov
         
-        # compute flux ratio for the colour
-        colour, colour_err = self._compute_colour(rest_kcorr_flux, rest_kcorr_cov, zp1, zp2)
-        self.colour, self.colour_err = colour, colour_err
-        self._compute_colour_stretch()
+        # compute colour and colour-stretch
+        self._compute_colour(rest_kcorr_flux, rest_kcorr_cov, zp1, zp2)
+        if set_st is True:
+            self._compute_colour_stretch()
 
         if plot is True:
             fig, ax = plt.subplots()
-            ax.plot(pred_phase, colour)
-            ax.fill_between(pred_phase, colour - colour_err, colour + colour_err, 
+            ax.plot(pred_phase, self.colour)
+            ax.fill_between(pred_phase, 
+                            self.colour - self.colour_err, 
+                            self.colour + self.colour_err, 
                             alpha=0.2)
             ax.set_ylabel(fr'$({band1} - {band2})$ (mag)', fontsize=16)
-            ax.set_xlabel('Days since B-maximum', fontsize=16)
+            ax.set_xlabel(r'Days since $t_0$', fontsize=16)
             ax.set_title(f'"{self.source}" SED source (z={self.z})', fontsize=16)
             ax.tick_params('both', labelsize=14)
             plt.show()
@@ -261,10 +314,36 @@ class Refiner(object):
 
         colour = -2.5 * np.log10(f1 / f2) + (zp1 - zp2)
         colour_err = np.sqrt(var_colour)
-    
-        return colour, colour_err
+        self.colour, self.colour_err = colour, colour_err
 
     def _compute_colour_stretch(self):
+        """Computes the colour stretch parameter for the bands used 
+        in the colour curve calculation.
+        """
+        idmax = np.argmax(self.colour)
+        st_phase = self.pred_phase[idmax]
+
+        # monte-carlo sampling to estimate the standard deviation
+        # use a constrained phase range
+        mask = (st_phase - 9 < self.pred_phase) & (self.pred_phase < st_phase + 9)  
+        pred_phase = self.pred_phase[mask]
+        length = len(self.colour[mask])
+        colours = np.random.normal(self.colour[mask], 
+                                self.colour_err[mask], 
+                                size=(10000, length)
+                                )
+        # calculate the standard deviation
+        st_list = []
+        for colour in colours:
+            st_idx = np.argmax(colour)
+            st_list.append(pred_phase[st_idx])
+        # divided by 30 assuming sBV
+        self.st, self.st_err = st_phase / 30, np.std(st_list) / 30
+
+    def _compute_colour_stretch_OLD(self):
+        """Computes the colour stretch parameter for the bands used 
+        in the colour curve calculation.
+        """
         # colour-stretch between 0.4 and 1.4 translate to phases between 12 and 42 days
         # assuming sBV...
         mask = (12 < self.pred_phase) & (self.pred_phase < 42)  
@@ -280,7 +359,32 @@ class Refiner(object):
             N = len(flux) // 2
             f1 = flux[:N]
             f2 = flux[N:]
-            flux_ratio = -2.5 * np.log10(f1 / f2)
-            st_idx = np.argmax(flux_ratio)
-            st_list.append(pred_phase[st_idx])
-        self.st, self.st_err = np.mean(st_list) / 30, np.std(st_list) / 30
+            colour = -2.5 * np.log10(f1 / f2)
+            st_idx = np.argmax(colour)
+            st_list.append(pred_phase[st_idx] / 30)
+        self.st, self.st_err = np.mean(st_list), np.std(st_list)
+
+    def fit_model(self):
+        """Fits the Source SED model to the photometry.
+        """
+        # select parameters to fit
+        params_to_exclude = ['z', 'mwebv', 'mwr_v']
+        parameters = [param for param in self.sed.model.param_names 
+                      if param not in params_to_exclude]
+        # fit model
+        result, fitted_model = sncosmo.fit_lc(self.phot.data, 
+                                              self.sed.model, 
+                                              parameters
+                                             )
+        # get t0 and results
+        id_t0 = result.param_names.index("t0")
+        self.t0 = result.parameters[id_t0]
+        self.fitted_model = fitted_model
+        self.result = result
+        
+    def plot_sncosmo_fit(self):
+        """Plots the sncosmo fit.
+        """
+        sncosmo.plot_lc(self.phot.data, 
+                        model=self.fitted_model, 
+                        errors=self.result.errors)

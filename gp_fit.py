@@ -17,22 +17,25 @@ def prepare_gp_inputs(times, wavelengths, fluxes, flux_errors):
     return X, y, yerr, y_norm
     
 def fit_gp_model(times, wavelengths, fluxes, flux_errors, k1='Matern52', fit_mean=False, 
-                 time_scale=None, add_noise=True):
+                 time_scale=None, wave_scale=None, add_noise=True):
     
     assert k1 in ['Matern52', 'Matern32', 'ExpSquared'], "Not a valid kernel"
     def build_gp(params):
         """Creates a Gaussian Process model.
         """
-        nonlocal time_scale, add_noise  # import from main function
+        nonlocal time_scale, wave_scale, add_noise  # import from main function
         if time_scale is None:
             log_time_scale = params["log_scale"][0]
         else:
             log_time_scale = np.log(time_scale)
+        if wave_scale is None:
+            log_wave_scale = params["log_scale"][-1]
+        else:
+            log_wave_scale = np.log(wave_scale)
         if add_noise is True:
             noise = jnp.exp(2 * params["log_noise"])
         else:
             noise = 0.0
-        log_wave_scale = params["log_scale"][-1]
 
         # select time-axis kernel
         if k1 == 'Matern52':
@@ -63,13 +66,18 @@ def fit_gp_model(times, wavelengths, fluxes, flux_errors, k1='Matern52', fit_mea
     X, y, yerr, _ = prepare_gp_inputs(times, wavelengths, fluxes, flux_errors)
 
     # GP hyper-parameters
-    scales = np.array([30, 2000]) # units: days, angstroms
+    scales = np.array([30, 10_000]) # units: days, angstroms
+    if time_scale is not None:
+        scales = np.delete(scales, 0)
+    if wave_scale is not None:
+        scales = np.delete(scales, -1)
     
     params = {
         "log_amp": jnp.log(y.var()),
-        "log_scale": jnp.log(scales),
         "log_noise": jnp.log(np.mean(yerr)),
     }
+    if len(scales) != 0:
+        params.update({"log_scale": jnp.log(scales)})
     if fit_mean is True:
         params.update({"log_mean": jnp.log(np.average(y, weights=1/yerr**2))})
 
@@ -77,6 +85,8 @@ def fit_gp_model(times, wavelengths, fluxes, flux_errors, k1='Matern52', fit_mea
     solver = jaxopt.ScipyMinimize(fun=loss)
     soln = solver.run(params)
     gp_model = build_gp(soln.params)
+    gp_model.__dict__["init_params"] = params
+    gp_model.__dict__["params"] = soln.params
     
     return gp_model
 

@@ -22,6 +22,8 @@ class SED(object):
         source: sncosmo source.
         z: redshift.
         mwebv: Milky-Way dust extinction.
+        phase_range: phase range to be used for the SED model. 
+        bands: Bands to use.
         """
         self.source = source
         self.z = z
@@ -36,11 +38,13 @@ class SED(object):
         self.colours = {'ztf::g':"green", 'ztf::r':"red", 'ztf::i':"gold"}
         # time range
         self.phase_range = phase_range
-        step = 0.1
         self.times = np.arange(self.phase_range[0], 
-                               self.phase_range[1] + step,
-                               step
+                               self.phase_range[1] + 0.1,
+                               0.1
                               )
+        # sets the colour-stretch of the model
+        self._set_initial_st()
+        self._st = np.copy(self._init_st)
     
     def load_model(self, source, mw_dust_law: sncosmo.PropagationEffect = None) -> sncosmo.models.Model:
         """Loads the SED model from an sncosmo Source.
@@ -63,6 +67,14 @@ class SED(object):
             bands_wave = np.r_[bands_wave, sncosmo.get_bandpass(band).wave]
         self.minwave = bands_wave.min()
         self.maxwave = bands_wave.max()
+        
+    def _set_initial_st(self):
+        """Calculates the colour-stretch of the SED model.
+        """
+        magB = self.rest_model.bandmag("cspb", "ab", self.times)
+        magV = self.rest_model.bandmag("cspv", "ab", self.times)
+        idmax = np.argmax(np.abs(magB - magV))
+        self._init_st = self.times[idmax] / 30
 
     def plot_lightcurves(self, zp: float = 30, zpsys = 'ab', restframe: bool = False):
         """Plots the model light curves.
@@ -75,12 +87,14 @@ class SED(object):
         # plot light curves
         fig, ax = plt.subplots(figsize=(6, 4))
         for band, colour in self.colours.items():
-            flux = model.bandflux(band, self.times, zp=zp, zpsys=zpsys)
+            if band not in self.bands:
+                continue
+            flux = model.bandflux(band, self.times / (self._st / self._init_st), zp=zp, zpsys=zpsys)
             mag = -2.5 * np.log10(flux) + zp
             ax.plot(self.times, mag, label=band, color=colour)
         # config
         plt.gca().invert_yaxis()
-        ax.set_xlabel('Days since B-maximum', fontsize=16)
+        ax.set_xlabel(r'Days since $t_0$', fontsize=16)
         ax.set_ylabel('Apparent Magnitude', fontsize=16)
         ax.set_title(f'"{self.source}" SED source (z={self.z})', fontsize=16)
         ax.tick_params('both', labelsize=14)
@@ -98,9 +112,9 @@ class SED(object):
             maxwave = self.maxwave
         # get flux
         rest_wave = np.arange(self.rest_model.minwave(), self.rest_model.maxwave() )
-        rest_flux = self.rest_model.flux(phase, rest_wave)
+        rest_flux = self.rest_model.flux(phase / (self._st / self._init_st), rest_wave)
         wave = np.arange(self.model.minwave(), self.model.maxwave())
-        flux = self.model.flux(phase, wave)
+        flux = self.model.flux(phase / (self._st / self._init_st), wave)
         # plot SED
         fig, ax = plt.subplots(figsize=(6, 4))
         ax.plot(rest_wave, rest_flux, label="Rest-frame")
@@ -128,12 +142,12 @@ class SED(object):
         """
         fig, ax = plt.subplots(figsize=(6, 4))
         for band, colour in self.colours.items():
-            rest_flux = self.rest_model.bandflux(band, self.times, zp=zp, zpsys=zpsys)
-            flux = self.model.bandflux(band, self.times, zp=zp, zpsys=zpsys) 
+            rest_flux = self.rest_model.bandflux(band, self.times / (self._st / self._init_st), zp=zp, zpsys=zpsys)
+            flux = self.model.bandflux(band, self.times / (self._st / self._init_st), zp=zp, zpsys=zpsys) 
             kcorr = -2.5 * np.log10(rest_flux / flux)
             ax.plot(self.times, kcorr, label=band, color=colour)
         
-        ax.set_xlabel('Days since B-maximum', fontsize=16)
+        ax.set_xlabel(r'Days since $t_0$', fontsize=16)
         ax.set_ylabel(r'$K$-correction (mag)', fontsize=16)
         ax.set_title(f'"{self.source}" SED source (z={self.z})', fontsize=16)
         ax.tick_params('both', labelsize=14)
